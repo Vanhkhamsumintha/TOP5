@@ -4313,6 +4313,59 @@ function updateLocalHPArmorInstant(newHp,newArmor){
   }
 }
 
+async function applyDamageEventToPlayer(targetId,damage,eventKey,ledgerField){
+  if(!firebaseConnected || !roomCode || !targetId || !eventKey || !ledgerField)return false;
+  const playerRef=ref(database,`rooms/${roomCode}/players/${targetId}`);
+  const ledgerRef=ref(database,`rooms/${roomCode}/players/${targetId}/${ledgerField}/${eventKey}`);
+
+  // Claim เฉพาะ event ของ damage ที่ node เล็ก ๆ เพื่อไม่ชนกับการเดิน x/z/moving
+  const claim=await withFirebaseTimeout(runTransaction(ledgerRef,current=>{
+    if(current!==null && current!==undefined)return current;
+    return Date.now();
+  }),`ล็อกดาเมจ ${eventKey}`);
+  if(!claim.committed)return false;
+
+  const snap=await withFirebaseTimeout(get(playerRef),`อ่าน HP ผู้เล่น ${targetId}`);
+  const current=snap.exists()?snap.val():null;
+  if(!current || current.dead===true || current.online===false)return false;
+
+  const currentArmor=Math.max(0,Number.isFinite(Number(current.armor))?Number(current.armor):0);
+  const currentHp=Math.max(0,Number.isFinite(Number(current.hp))?Number(current.hp):100);
+  const armorDamage=Math.min(currentArmor,damage);
+  const remainingDamage=damage-armorDamage;
+  const newArmor=Math.max(0,currentArmor-armorDamage);
+  const newHp=Math.max(0,currentHp-remainingDamage);
+
+  const payload={
+    armor:newArmor,
+    hp:newHp
+  };
+  if(newHp<=0){
+    payload.armor=0;
+    payload.hp=0;
+    payload.dead=true;
+    payload.online=false;
+  }
+
+  // สำคัญที่สุด: update เฉพาะ HP/Armor/สถานะตาย ไม่เขียนทับ x/z/moving
+  await withFirebaseTimeout(update(playerRef,payload),`บันทึก HP ผู้เล่น ${targetId}`);
+  return {applied:true,hp:payload.hp,armor:payload.armor,dead:newHp<=0};
+}
+
+function handleLocalDeathFromDamage(){
+  const me=window.__quizBattlePlayers?.[playerId]||{};
+  spectatorTeam=me.team||spectatorTeam||"";
+  spectatorMode=!!spectatorTeam;
+  spectatorTargetId=null;
+  closeQuestionOverlay();
+  const deadMesh=playerMeshes.get(playerId);
+  if(deadMesh){scene.remove(deadMesh);playerMeshes.delete(playerId);}
+  remoteTargets.delete(playerId);
+  localPlayer=null;
+  const spec=document.getElementById("spectatorOverlay");
+  if(spec)spec.classList.remove("hidden");
+}
+
 function applyBombDamageOptimistic(bombId){
   if(optimisticBombDamage.has(bombId))return false;
   const me=window.__quizBattlePlayers?.[playerId];
@@ -4357,9 +4410,6 @@ function queueBombDamage(bombId,data){
   processedBombDamage.add(bombId);
   pendingBombDamageIds.add(bombId);
 
-  // ลด HP/เกราะในเครื่องทันทีที่ effect ระเบิดเริ่มขึ้น ไม่รอ Firebase round-trip
-  applyBombDamageOptimistic(bombId);
-
   // เริ่มเขียน Firebase ทันที ไม่หน่วง 10ms
   if(!pendingBombDamageTimer){
     pendingBombDamageTimer=Promise.resolve().then(async()=>{
@@ -4376,53 +4426,12 @@ async function flushPendingBombDamage(){
 
   for(const bombId of ids){
     try{
-      const playerRef=ref(database,`rooms/${roomCode}/players/${playerId}`);
-      const result=await withFirebaseTimeout(
-        runTransaction(playerRef,current=>{
-          if(!current || current.dead===true || current.online===false)return current;
-          // Firebase เป็นตัวเก็บผลถาวรของ bomb แต่ละลูก: ทุกลูกหัก 10 เท่ากัน
-          // และใช้ lastBombDamageId ป้องกัน transaction/reconnect ทำให้ลูกเดิมถูกหักซ้ำ
-          if(current.lastBombDamageId===bombId)return current;
-
-          const damage=BOMB_DAMAGE;
-          const currentArmor=Math.max(0,Number.isFinite(Number(current.armor))?Number(current.armor):0);
-          const currentHp=Math.max(0,Number.isFinite(Number(current.hp))?Number(current.hp):100);
-          const armorDamage=Math.min(currentArmor,damage);
-          const remainingDamage=damage-armorDamage;
-          const newArmor=Math.max(0,currentArmor-armorDamage);
-          const newHp=Math.max(0,currentHp-remainingDamage);
-
-          if(newHp<=0)return {...current,armor:0,hp:0,dead:true,online:false,lastBombDamageId:bombId};
-          return {...current,armor:newArmor,hp:newHp,lastBombDamageId:bombId};
-        }),
-        `ຫັກ HP/ເກາະ 10 ຈາກລະເບີດ ${bombId}`
-      );
-
-      if(!result.committed)continue;
-      const saved=result.snapshot.val();
-      if(!saved)continue;
-
-      const newArmor=Math.max(0,Number(saved.armor)||0);
-      const newHp=Math.max(0,Number(saved.hp)||0);
-      updateLocalHPArmorInstant(newHp,newArmor);
-
-      if(newHp<=0){
-        const meBeforeDeath=window.__quizBattlePlayers?.[playerId]||saved;
-        spectatorTeam=meBeforeDeath?.team||saved?.team||"";
-        spectatorMode=!!spectatorTeam;
-        spectatorTargetId=null;
-        closeQuestionOverlay();
-        const deadMesh=playerMeshes.get(playerId);
-        if(deadMesh){scene.remove(deadMesh);playerMeshes.delete(playerId);}
-        remoteTargets.delete(playerId);
-        localPlayer=null;
-        window.__quizBattlePlayers={...(window.__quizBattlePlayers||{}),[playerId]:saved};
-        const spec=document.getElementById("spectatorOverlay");
-        if(spec)spec.classList.remove("hidden");
-      }
+      const result=await applyDamageEventToPlayer(playerId,BOMB_DAMAGE,bombId,'lastBombDamageEvents');
+      if(!result?.applied)continue;
+      updateLocalHPArmorInstant(result.hp,result.armor);
+      if(result.dead)handleLocalDeathFromDamage();
     }catch(error){
       pendingBombDamageIds.add(bombId);
-      // ไม่ลดซ้ำทางจอ: optimisticBombDamage กันไว้แล้ว แต่ retry Firebase ได้
       if(!pendingBombDamageTimer){
         pendingBombDamageTimer=setTimeout(()=>{
           pendingBombDamageTimer=null;
@@ -4730,82 +4739,68 @@ function applyFireRingDamageOptimistic(key){
   return true;
 }
 
-function queueFireRingDamage(id, data, tick) {
-  if (!gameStarted || !roomCode || !playerId || !data) return;
+function queueFireRingDamage(id,data,tick){
+  if(!gameStarted || !roomCode || !playerId || !data)return;
+  if(String(data.ownerId||'')===String(playerId))return;
 
-  // คนวางวงไฟไม่โดนวงไฟตัวเอง
-  if (String(data.ownerId || '') === String(playerId)) return;
+  const pos=getCurrentLocalWorldPosition();
+  if(!pos)return;
+  const fx=Number(data.x)||0;
+  const fz=Number(data.z)||0;
+  if(Math.hypot(pos.x-fx,pos.z-fz)>FIRE_RING_RADIUS)return;
 
-  const pos = getCurrentLocalWorldPosition();
-  if (!pos) return;
+  const key=`${id}:${tick}`;
+  if(fireRingProcessedTicks.has(key))return;
+  fireRingProcessedTicks.add(key);
 
-  const fx = Number(data.x) || 0;
-  const fz = Number(data.z) || 0;
-
-  const distance = Math.hypot(
-    pos.x - fx,
-    pos.z - fz
-  );
-
-  // ⭐ ออกจากวงแล้ว = ไม่ได้รับ Damage Tick นี้
-  if (distance > FIRE_RING_RADIUS) return;
-
-  // ⭐ ต้องใช้ ID ของวงไฟ + Tick
-  // เพื่อให้วงไฟ 2 วงไม่หักล้างกัน
-const key = `${id}:${tick}`;
-
-if (fireRingProcessedTicks.has(key)) return;
-
-fireRingProcessedTicks.add(key);
+  // ກວດຈາກຕຳແໜ່ງຈິງຂອງຄົນທີ່ກຳລັງເດີນ ແລະຫັກ HP ທັນທີ.
+  applyDamageEventToPlayer(playerId,FIRE_RING_DAMAGE,key,'lastFireRingDamageEvents')
+    .then(result=>{
+      if(!result?.applied)return;
+      updateLocalHPArmorInstant(result.hp,result.armor);
+      if(result.dead)handleLocalDeathFromDamage();
+    })
+    .catch(error=>console.error("ວົງໄຟຫັກ HP ຜູ້ຫຼິ້ນ:",error));
 }
 
 async function applyFireRingDamageAsHost(id,data,tick){
   if(!isRoomHost || !roomCode || !data)return false;
+
   const tickKey=`${id}:${tick}`;
   if(fireRingHostTickInFlight.has(tickKey))return false;
   fireRingHostTickInFlight.add(tickKey);
+
   try{
-    const snap=await withFirebaseTimeout(get(ref(database,`rooms/${roomCode}/players`)),"ອ່ານຕຳແໜ່ງຜູ້ຫຼິ້ນສຳລັບວົງໄຟ");
-    const players=snap.exists()?snap.val():{};
-    const fx=Number(data.x)||0,fz=Number(data.z)||0;
+    const playersSnap=await withFirebaseTimeout(
+      get(ref(database,`rooms/${roomCode}/players`)),
+      "ອ່ານຕຳແໜ່ງຜູ້ຫຼິ້ນສຳລັບວົງໄຟ"
+    );
+    const players=playersSnap.exists()?playersSnap.val():{};
+    const fx=Number(data.x)||0;
+    const fz=Number(data.z)||0;
+    let applied=false;
+
     for(const [targetId,target] of Object.entries(players)){
-      if(!target||target.dead===true||target.online===false)continue;
+      if(!target || target.dead===true || target.online===false)continue;
       if(String(data.ownerId||'')===String(targetId))continue;
+
+      // ສຳຄັນ: ກວດ x/z ລ່າສຸດ ໂດຍບໍ່ສົນ moving.
       const tx=Number(target.x),tz=Number(target.z);
-      if(!Number.isFinite(tx)||!Number.isFinite(tz)||Math.hypot(tx-fx,tz-fz)>FIRE_RING_RADIUS)continue;
+      if(!Number.isFinite(tx)||!Number.isFinite(tz))continue;
+      if(Math.hypot(tx-fx,tz-fz)>FIRE_RING_RADIUS)continue;
 
-      const ledgerRef=ref(database,`rooms/${roomCode}/players/${targetId}/lastFireRingDamageKeys/${tickKey}`);
-      if((await withFirebaseTimeout(get(ledgerRef),`ກວດ tick ວົງໄຟ ${tickKey}`)).exists())continue;
-
-      const armorRef=ref(database,`rooms/${roomCode}/players/${targetId}/armor`);
-      const armorTx=await withFirebaseTimeout(runTransaction(armorRef,current=>{
-        const a=Math.max(0,Number(current)||0);
-        return Math.max(0,a-Math.min(a,FIRE_RING_DAMAGE));
-      }),`ວົງໄຟຫັກເກາະ ${targetId}`);
-      if(!armorTx.committed)continue;
-
-      const oldArmor=Math.max(0,Number(target.armor)||0);
-      const newArmor=Math.max(0,Number(armorTx.snapshot.val())||0);
-      const remaining=Math.max(0,FIRE_RING_DAMAGE-Math.max(0,oldArmor-newArmor));
-      let newHp=Math.max(0,Number(target.hp??100));
-
-      if(remaining>0){
-        const hpRef=ref(database,`rooms/${roomCode}/players/${targetId}/hp`);
-        const hpTx=await withFirebaseTimeout(runTransaction(hpRef,current=>{
-          const hp=Math.max(0,Number(current??100));
-          return Math.max(0,hp-remaining);
-        }),`ວົງໄຟຫັກ HP ${targetId}`);
-        if(!hpTx.committed)continue;
-        newHp=Math.max(0,Number(hpTx.snapshot.val())||0);
+      const result=await applyDamageEventToPlayer(
+        targetId,
+        FIRE_RING_DAMAGE,
+        tickKey,
+        'lastFireRingDamageEvents'
+      );
+      if(result?.applied){
+        applied=true;
+        if(targetId===playerId)updateLocalHPArmorInstant(result.hp,result.armor);
       }
-
-      await withFirebaseTimeout(set(ledgerRef,Date.now()),`ບັນທຶກ tick ວົງໄຟ ${tickKey}`);
-      if(newHp<=0){
-        await withFirebaseTimeout(update(ref(database,`rooms/${roomCode}/players/${targetId}`),{dead:true,online:false}),`ປິດສະຖານະ ${targetId}`);
-      }
-      if(targetId===playerId)updateLocalHPArmorInstant(newHp,newArmor);
     }
-    return true;
+    return applied || true;
   }catch(error){
     console.error("ວົງໄຟຫັກ HP/ເກາະ:",error);
     return false;
@@ -5302,55 +5297,52 @@ async function placeIce(){
 window.placeIce=placeIce;
 
 async function explodeBombAsHost(id,data){
-  if(!isRoomHost||!roomCode||!data||data.active===false)return;
+  if(!isRoomHost || !roomCode || !data || data.active===false)return;
+
+  // ໃຫ້ Host ເປັນຄົນຄຳນວນຄວາມເສຍຫາຍຂອງ "ທຸກຄົນ" ທີ່ຢູ່ໃນລັດສະໝີລະເບີດ
+  // ບໍ່ແຕະຟັງຊັນລະເບີດ/ອື່ນໆ: ປ່ຽນສະເພາະຈຸດຫັກ HP ໃຫ້ເປັນແບບກາງ.
   try{
     const bombRef=ref(database,`rooms/${roomCode}/bombs/${id}`);
     const claim=await withFirebaseTimeout(runTransaction(bombRef,current=>{
-      if(!current||current.active===false||current.exploded)return;
+      if(!current || current.active===false || current.exploded)return;
       return {...current,active:false,exploded:true,explodedAt:Date.now()};
     }),"ປະມວນຜົນສະຖານະລະເບີດ");
+
     if(!claim.committed)return;
 
-    const snap=await withFirebaseTimeout(get(ref(database,`rooms/${roomCode}/players`)),"ອ່ານຕຳແໜ່ງຜູ້ຫຼິ້ນ");
-    const players=snap.exists()?snap.val():{};
-    const bx=Number(data.x)||0,bz=Number(data.z)||0;
+    const playersSnap=await withFirebaseTimeout(
+      get(ref(database,`rooms/${roomCode}/players`)),
+      "ອ່ານຕຳແໜ່ງຜູ້ຫຼິ້ນ"
+    );
+
+    const players=playersSnap.exists()?playersSnap.val():{};
+    const bx=Number(data.x)||0;
+    const bz=Number(data.z)||0;
 
     for(const [targetId,target] of Object.entries(players)){
-      if(!target||target.dead===true||target.online===false)continue;
+      if(!target || target.dead===true || target.online===false)continue;
+      // ผู้วางไฟได้รับการปกป้องจากวงไฟลูกนั้น ไม่รับ damage จากไฟตัวเอง
       if(String(data.ownerId||'')===String(targetId))continue;
-      const tx=Number(target.x),tz=Number(target.z);
-      if(!Number.isFinite(tx)||!Number.isFinite(tz)||Math.hypot(tx-bx,tz-bz)>BOMB_RADIUS)continue;
 
-      const markerRef=ref(database,`rooms/${roomCode}/players/${targetId}/lastBombDamageId`);
-      if(String((await withFirebaseTimeout(get(markerRef),`ກວດ damage ລະເບີດ ${id}`)).val()||'')===String(id))continue;
+      const tx=Number(target.x);
+      const tz=Number(target.z);
+      if(!Number.isFinite(tx) || !Number.isFinite(tz))continue;
 
-      const armorRef=ref(database,`rooms/${roomCode}/players/${targetId}/armor`);
-      const armorTx=await withFirebaseTimeout(runTransaction(armorRef,current=>{
-        const a=Math.max(0,Number(current)||0);
-        return Math.max(0,a-Math.min(a,BOMB_DAMAGE));
-      }),`ລະເບີດຫັກເກາະ ${targetId}`);
-      if(!armorTx.committed)continue;
+      const distance=Math.hypot(tx-bx,tz-bz);
+      if(distance>BOMB_RADIUS)continue;
 
-      const oldArmor=Math.max(0,Number(target.armor)||0);
-      const newArmor=Math.max(0,Number(armorTx.snapshot.val())||0);
-      const remaining=Math.max(0,BOMB_DAMAGE-Math.max(0,oldArmor-newArmor));
-      let newHp=Math.max(0,Number(target.hp??100));
+      const result=await applyDamageEventToPlayer(
+        targetId,
+        BOMB_DAMAGE,
+        id,
+        'lastBombDamageEvents'
+      );
 
-      if(remaining>0){
-        const hpRef=ref(database,`rooms/${roomCode}/players/${targetId}/hp`);
-        const hpTx=await withFirebaseTimeout(runTransaction(hpRef,current=>{
-          const hp=Math.max(0,Number(current??100));
-          return Math.max(0,hp-remaining);
-        }),`ລະເບີດຫັກ HP ${targetId}`);
-        if(!hpTx.committed)continue;
-        newHp=Math.max(0,Number(hpTx.snapshot.val())||0);
+      if(result?.applied && targetId===playerId){
+        updateLocalHPArmorInstant(result.hp,result.armor);
+        if(result.dead)handleLocalDeathFromDamage();
       }
 
-      await withFirebaseTimeout(set(markerRef,id),`ບັນທຶກ damage ລະເບີດ ${id}`);
-      if(newHp<=0){
-        await withFirebaseTimeout(update(ref(database,`rooms/${roomCode}/players/${targetId}`),{armor:0,hp:0,dead:true,online:false}),`ປິດສະຖານະ ${targetId}`);
-      }
-      if(targetId===playerId)updateLocalHPArmorInstant(newHp,newArmor);
     }
   }catch(error){
     console.error("ຫັກ HP ຜູ້ຫຼິ້ນທີ່ຢູ່ໃນລັດສະໝີລະເບີດ:",error);
