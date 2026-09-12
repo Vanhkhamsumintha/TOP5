@@ -5251,21 +5251,24 @@ async function applyIceFreezeAsHost(id,data){
     const tx=Number(target.x),tz=Number(target.z);
     if(!Number.isFinite(tx)||!Number.isFinite(tz))continue;
     if(Math.hypot(tx-ix,tz-iz)>ICE_RADIUS)continue;
-    const targetRef=ref(database,`rooms/${roomCode}/players/${targetId}`);
-    await withFirebaseTimeout(runTransaction(targetRef,current=>{
-      if(!current || current.dead===true || current.online===false)return current;
-
-      // ສຳຄັນ: ບໍ່ຕໍ່ເວລາ freeze ຊ້ຳທຸກ tick.
-      // ຂຽນ Firebase ພຽງຄັ້ງດຽວຕໍ່ກັບດັກນ້ຳແຂງ 1 ອັນ
-      // ເພື່ອບໍ່ໃຫ້ realtime listener ເຮັດໃຫ້ເກມ lag ແລະ freeze ຍາວເກີນ 3 ວິນາທີ.
-      if(String(current.frozenByIceId||'')===String(id))return current;
-
-      const currentUntil=Number(current.frozenUntil)||0;
-      // ຖ້າກຳລັງຖືກນ້ຳແຂງອື່ນຢູ່ ຢ່າຂຽນທັບ.
+    // ສຳຄັນຫຼາຍ: ຢ່າ transaction ທີ່ node players/${targetId} ທັງກ້ອນ
+    // ເພາະຄົນທີ່ກຳລັງເດີນຈະ update x/z/moving ທຸກ ~50ms ແລະຈະຊົນກັບ transaction
+    // ເຮັດໃຫ້ຄົນຢືນຢູ່ຖືກ freeze ໄວ ແຕ່ຄົນກຳລັງເດີນ freeze ບໍ່ທັນ.
+    // transaction ສະເພາະ frozenUntil ເທົ່ານັ້ນ ຈະບໍ່ຂັດກັບ position sync.
+    const freezeUntilRef=ref(database,`rooms/${roomCode}/players/${targetId}/frozenUntil`);
+    const freezeTx=await withFirebaseTimeout(runTransaction(freezeUntilRef,current=>{
+      const currentUntil=Number(current)||0;
+      // ຖ້າຍັງຖືກນ້ຳແຂງອື່ນຢູ່ ຢ່າຂຽນທັບ.
       if(currentUntil>now)return current;
-
-      return {...current,frozenUntil:now+ICE_FREEZE_MS,frozenByIceId:id};
+      return now+ICE_FREEZE_MS;
     }),`ແຊ່ແຂງຜູ້ຫຼິ້ນ ${targetId}`);
+
+    if(freezeTx.committed){
+      await withFirebaseTimeout(
+        update(ref(database,`rooms/${roomCode}/players/${targetId}`),{frozenByIceId:id}),
+        `ບັນທຶກທີ່ມານ້ຳແຂງ ${targetId}`
+      );
+    }
   }
 }
 
