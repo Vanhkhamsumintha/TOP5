@@ -3038,15 +3038,27 @@ function writeLocalSolo(x){try{localStorage.setItem("awakadSoloTop5",JSON.string
 function soloRankCompare(a,b){return Number(b.correct||0)-Number(a.correct||0)||Number(a.timeMs||0)-Number(b.timeMs||0)||Number(a.updatedAt||0)-Number(b.updatedAt||0);}
 function soloTie(a,b){return Number(a.correct||0)===Number(b.correct||0)&&Number(a.timeMs||0)===Number(b.timeMs||0);}
 async function getSoloLeaders(subject){
+
+  // พยายามเปิด Firebase ก่อน
+  if(!db){
+    try{
+      initFirebase();
+    }catch(e){
+      console.warn("Solo Firebase init:",e);
+    }
+  }
+
   const local=readLocalSolo()[subject]||[];
 
-  // ให้ Solo เชื่อม Firebase ก่อนอ่านสถิติ
-  if(!db && !initFirebase()){
+  if(!db){
     return local.sort(soloRankCompare).slice(0,5);
   }
 
   try{
-    const snap=await get(soloLeaderboardRoot().child(subject));
+    const snap=await get(
+      soloLeaderboardRoot().child(subject)
+    );
+
     const v=snap.val();
 
     if(!v){
@@ -3058,25 +3070,26 @@ async function getSoloLeaders(subject){
       .slice(0,5);
 
   }catch(e){
-    console.error("อ่าน Solo TOP 5 ไม่สำเร็จ:",e);
+    console.warn("Solo leaderboard read:",e);
     return local.sort(soloRankCompare).slice(0,5);
   }
 }
 async function saveSoloLeaderboard(subject,name,correct,timeMs){
+  if(!subject||!name)return false;
 
-  if(!subject || !name) return false;
-
-  // สำคัญ: บังคับให้ Solo เชื่อม Firebase
-  if(!db && !initFirebase()){
-    console.error("Solo: Firebase ยังไม่พร้อม");
-    return false;
+  // บังคับให้ Firebase ถูก initialize ก่อนบันทึก Solo
+  if(!db){
+    try{
+      initFirebase();
+    }catch(e){
+      console.warn("Solo Firebase init:",e);
+    }
   }
 
   const now=Date.now();
-
   const key=cleanName(name)
     .replace(/[.#$/\[\]]/g,"_")
-    .slice(0,80) || "player";
+    .slice(0,80)||"player";
 
   const incoming={
     name:displayName(name),
@@ -3085,77 +3098,74 @@ async function saveSoloLeaderboard(subject,name,correct,timeMs){
     updatedAt:now
   };
 
-  try{
+  // เก็บ local สำรองไว้เหมือนเดิม
+  const local=readLocalSolo();
+  const arr=Array.isArray(local[subject])?local[subject]:[];
+  const idx=arr.findIndex(
+    x=>cleanName(x.name)===cleanName(name)
+  );
 
-    const node=soloLeaderboardRoot()
-      .child(subject)
-      .child(key);
+  if(idx>=0){
+    if(soloRankCompare(incoming,arr[idx])<0){
+      arr[idx]={...arr[idx],...incoming};
+    }
+  }else{
+    arr.push(incoming);
+  }
+
+  local[subject]=arr.sort(soloRankCompare).slice(0,5);
+  writeLocalSolo(local);
+
+  // ถ้า Firebase ยังไม่พร้อม ให้จบที่ local backup
+  if(!db){
+    console.warn("Solo: Firebase ไม่พร้อม จึงบันทึกเฉพาะ localStorage");
+    return false;
+  }
+
+  try{
+    const root=soloLeaderboardRoot();
+    const node=root.child(subject).child(key);
 
     const snap=await get(node);
     const old=snap.val();
 
-    // เก็บเฉพาะสถิติที่ดีกว่าเดิม
     if(!old || soloRankCompare(incoming,old)<0){
       await set(node,incoming);
     }
 
-    // อ่านข้อมูลจาก Firebase ใหม่
-    const allSnap=await get(
-      soloLeaderboardRoot().child(subject)
-    );
-
+    // ดึง TOP 5 จาก Firebase
+    const allSnap=await get(root.child(subject));
     const all=Object.entries(allSnap.val()||{})
-      .map(([id,x])=>({
-        ...x,
-        id
-      }))
+      .map(([id,x])=>({...x,id}))
       .sort(soloRankCompare);
 
-    // ตัดเหลือ TOP 5
+    // ลบอันดับเกิน TOP 5
     const updates={};
-
     all.slice(5).forEach(x=>{
       updates[x.id]=null;
     });
 
     if(Object.keys(updates).length){
-      await update(
-        soloLeaderboardRoot().child(subject),
-        updates
-      );
+      await update(root.child(subject),updates);
     }
 
-    // อัปเดต local cache ให้ตรง Firebase
-    const local=readLocalSolo();
+    // อัปเดต local จากข้อมูล Firebase
+    writeLocalSolo({
+      ...readLocalSolo(),
+      [subject]:all.slice(0,5)
+    });
 
-    local[subject]=all
-      .slice(0,5)
-      .map(x=>({
-        name:x.name,
-        correct:Number(x.correct||0),
-        timeMs:Number(x.timeMs||0),
-        updatedAt:x.updatedAt
-      }));
-
-    writeLocalSolo(local);
-
-    console.log(
-      "Solo TOP 5 บันทึกสำเร็จ:",
+    console.log("✅ Solo score saved to Firebase:",{
       subject,
-      incoming.name,
-      incoming.correct,
-      incoming.timeMs
-    );
+      name:incoming.name,
+      correct:incoming.correct,
+      timeMs:incoming.timeMs
+    });
 
     return true;
 
   }catch(e){
-
-    console.error(
-      "Solo TOP 5 Firebase บันทึกไม่สำเร็จ:",
-      e
-    );
-
+    console.error("❌ Solo Firebase save error:",e);
     return false;
   }
 }
