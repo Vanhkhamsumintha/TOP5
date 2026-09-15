@@ -2906,7 +2906,27 @@ function readLocalSolo(){try{return JSON.parse(localStorage.getItem("awakadSoloT
 function writeLocalSolo(x){try{localStorage.setItem("awakadSoloTop5",JSON.stringify(x));}catch(e){}}
 function soloRankCompare(a,b){return Number(b.correct||0)-Number(a.correct||0)||Number(a.timeMs||0)-Number(b.timeMs||0)||Number(a.updatedAt||0)-Number(b.updatedAt||0);}
 function soloTie(a,b){return Number(a.correct||0)===Number(b.correct||0)&&Number(a.timeMs||0)===Number(b.timeMs||0);}
-async function getSoloLeaders(subject){const local=readLocalSolo()[subject]||[];if(!db)return local.sort(soloRankCompare).slice(0,5);try{const snap=await get(soloLeaderboardRoot().child(subject));const v=snap.val();if(!v)return local.sort(soloRankCompare).slice(0,5);return Object.values(v).sort(soloRankCompare).slice(0,5);}catch(e){return local.sort(soloRankCompare).slice(0,5);}}
+async function getSoloLeaders(subject){
+  if(!db) return [];
+
+  try{
+    const snap = await get(
+      soloLeaderboardRoot().child(subject)
+    );
+
+    const v = snap.val();
+
+    if(!v) return [];
+
+    return Object.values(v)
+      .sort(soloRankCompare)
+      .slice(0,5);
+
+  }catch(e){
+    console.warn("getSoloLeaders:", e);
+    return [];
+  }
+}
 async function saveSoloLeaderboard(subject,name,correct,timeMs){
  if(!subject||!name)return;const now=Date.now(),key=cleanName(name).replace(/[.#$/\[\]]/g,"_").slice(0,80)||"player";const incoming={name:displayName(name),correct:Number(correct||0),timeMs:Number(timeMs||0),updatedAt:now};
  const local=readLocalSolo(),arr=Array.isArray(local[subject])?local[subject]:[],idx=arr.findIndex(x=>cleanName(x.name)===cleanName(name));
