@@ -2648,29 +2648,122 @@ function readLocalLeaders(){try{return JSON.parse(localStorage.getItem("awakadTo
 function writeLocalLeaders(x){try{localStorage.setItem("awakadTop5",JSON.stringify(x));}catch(e){}}
 async function getSubjectLeaders(subject){
   const fallback=readLocalLeaders()[subject]||[];
-  if(!db)return fallback;
+
+  // บังคับเชื่อม Firebase ก่อนอ่าน TOP 5
+  if(!db && !initFirebase()) return fallback;
+
   try{
-    const snap=await get(leaderboardRoot().child(subject)); const v=snap.val();
-    if(!v)return fallback;
-    return Object.values(v).sort((a,b)=>Number(b.score||0)-Number(a.score||0)||Number(a.updatedAt||0)-Number(b.updatedAt||0)).slice(0,5);
-  }catch(e){return fallback;}
+    const snap=await get(ref(db,`leaderboards/${subject}`));
+    const v=snap.val();
+
+    if(!v){
+      return fallback
+        .sort((a,b)=>Number(b.score||0)-Number(a.score||0))
+        .slice(0,5);
+    }
+
+    return Object.values(v)
+      .sort((a,b)=>
+        Number(b.score||0)-Number(a.score||0) ||
+        Number(a.updatedAt||0)-Number(b.updatedAt||0)
+      )
+      .slice(0,5);
+
+  }catch(e){
+    console.error("อ่าน TOP 5 จาก Firebase ไม่สำเร็จ:",e);
+    return fallback
+      .sort((a,b)=>Number(b.score||0)-Number(a.score||0))
+      .slice(0,5);
+  }
 }
 async function saveLeaderboard(subject,name,score){
-  if(!subject||!name)return;
-  const key=cleanName(name).replace(/[.#$/\[\]]/g,"_").slice(0,80)||"player",now=Date.now();
-  const local=readLocalLeaders(),arr=Array.isArray(local[subject])?local[subject]:[];
-  const idx=arr.findIndex(x=>cleanName(x.name)===cleanName(name));
-  if(idx>=0)arr[idx]={...arr[idx],name:displayName(name),score:Math.max(Number(arr[idx].score||0),Number(score||0)),updatedAt:now};
-  else arr.push({name:displayName(name),score:Number(score||0),updatedAt:now});
-  local[subject]=arr.sort((a,b)=>Number(b.score||0)-Number(a.score||0)).slice(0,5);writeLocalLeaders(local);
-  if(!db)return;
+  if(!subject || !name) return false;
+
+  // บังคับ Firebase
+  if(!db && !initFirebase()){
+    console.warn("Firebase ยังไม่พร้อม ไม่สามารถบันทึก TOP 5");
+    return false;
+  }
+
+  const key=cleanName(name)
+    .replace(/[.#$/\[\]]/g,"_")
+    .slice(0,80) || "player";
+
+  const now=Date.now();
+
+  const incoming={
+    name:displayName(name),
+    score:Number(score||0),
+    updatedAt:now
+  };
+
   try{
-    const old=await get(leaderboardRoot().child(subject).child(key)),prev=old.val()||{};
-    await set(leaderboardRoot().child(subject).child(key),{name:displayName(name),score:Math.max(Number(prev.score||0),Number(score||0)),updatedAt:now});
-    const snap=await get(leaderboardRoot().child(subject)),all=Object.entries(snap.val()||{}).map(([id,x])=>({...x,id})).sort((a,b)=>Number(b.score||0)-Number(a.score||0));
-    const updates={};all.slice(5).forEach(x=>updates[x.id]=null);if(Object.keys(updates).length)await update(leaderboardRoot().child(subject),updates);
-    local[subject]=all.slice(0,5).map(x=>({name:x.name,score:Number(x.score||0),updatedAt:x.updatedAt}));writeLocalLeaders(local);
-  }catch(e){console.warn("leaderboard save",e);}
+    const node=ref(db,`leaderboards/${subject}/${key}`);
+
+    // อ่านคะแนนเดิม
+    const oldSnap=await get(node);
+    const old=oldSnap.val() || {};
+
+    // เก็บคะแนนที่สูงกว่า
+    const finalScore=Math.max(
+      Number(old.score||0),
+      Number(incoming.score||0)
+    );
+
+    await set(node,{
+      name:incoming.name,
+      score:finalScore,
+      updatedAt:now
+    });
+
+    // อ่าน TOP 5 ใหม่จาก Firebase หลังเขียนเสร็จ
+    const allSnap=await get(ref(db,`leaderboards/${subject}`));
+
+    const all=Object.entries(allSnap.val()||{})
+      .map(([id,x])=>({
+        ...x,
+        id
+      }))
+      .sort((a,b)=>
+        Number(b.score||0)-Number(a.score||0) ||
+        Number(a.updatedAt||0)-Number(b.updatedAt||0)
+      );
+
+    // ลบเฉพาะอันดับที่เกิน TOP 5
+    const updates={};
+
+    all.slice(5).forEach(x=>{
+      updates[x.id]=null;
+    });
+
+    if(Object.keys(updates).length){
+      await update(ref(db,`leaderboards/${subject}`),updates);
+    }
+
+    // อัปเดต local cache ให้ตรงกับ Firebase
+    const top5=all.slice(0,5).map(x=>({
+      name:x.name,
+      score:Number(x.score||0),
+      updatedAt:x.updatedAt
+    }));
+
+    const local=readLocalLeaders();
+    local[subject]=top5;
+    writeLocalLeaders(local);
+
+    console.log(
+      "บันทึก TOP 5 สำเร็จ:",
+      subject,
+      incoming.name,
+      finalScore
+    );
+
+    return true;
+
+  }catch(e){
+    console.error("บันทึก TOP 5 Firebase ไม่สำเร็จ:",e);
+    return false;
+  }
 }
 async function registerFinishedScore(r){
   const subject=r.subjectId||"math";
@@ -2883,11 +2976,57 @@ window.startSelection=async function(){
 /* Register the final score once when the host sees the finished room. */
 let leaderboardRegisteredForRoom=null;
 const oldFinishPage=finishPage;
+
 finishPage=async function(r){
+
   oldFinishPage(r);
-  if(r?.phase==="finished" && roomCode && leaderboardRegisteredForRoom!==roomCode){
-    leaderboardRegisteredForRoom=roomCode;
-    await registerFinishedScore(r);
+
+  if(r?.phase!=="finished") return;
+
+  if(!roomCode) return;
+
+  if(leaderboardRegisteredForRoom===roomCode) return;
+
+  leaderboardRegisteredForRoom=roomCode;
+
+  try{
+
+    if(!db && !initFirebase()){
+      console.error("Firebase ไม่พร้อมตอนบันทึกคะแนนจบเกม");
+      leaderboardRegisteredForRoom=null;
+      return;
+    }
+
+    const subject=r.subjectId || "math";
+
+    const redName=r.players?.red?.name || "";
+    const blueName=r.players?.blue?.name || "";
+
+    const redScore=Number(r.scores?.red || 0);
+    const blueScore=Number(r.scores?.blue || 0);
+
+    console.log("FINAL SCORE:",{
+      subject,
+      redName,
+      redScore,
+      blueName,
+      blueScore
+    });
+
+    // รอให้บันทึกทั้งสองคนเสร็จจริง
+    await Promise.all([
+      saveLeaderboard(subject,redName,redScore),
+      saveLeaderboard(subject,blueName,blueScore)
+    ]);
+
+    console.log("อัปเดต TOP 5 Firebase สำเร็จ");
+
+  }catch(e){
+
+    console.error("registerFinishedScore error:",e);
+
+    // ให้สามารถลองบันทึกใหม่ได้
+    leaderboardRegisteredForRoom=null;
   }
 };
 
