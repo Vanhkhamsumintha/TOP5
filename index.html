@@ -3037,12 +3037,127 @@ function readLocalSolo(){try{return JSON.parse(localStorage.getItem("awakadSoloT
 function writeLocalSolo(x){try{localStorage.setItem("awakadSoloTop5",JSON.stringify(x));}catch(e){}}
 function soloRankCompare(a,b){return Number(b.correct||0)-Number(a.correct||0)||Number(a.timeMs||0)-Number(b.timeMs||0)||Number(a.updatedAt||0)-Number(b.updatedAt||0);}
 function soloTie(a,b){return Number(a.correct||0)===Number(b.correct||0)&&Number(a.timeMs||0)===Number(b.timeMs||0);}
-async function getSoloLeaders(subject){const local=readLocalSolo()[subject]||[];if(!db)return local.sort(soloRankCompare).slice(0,5);try{const snap=await get(soloLeaderboardRoot().child(subject));const v=snap.val();if(!v)return local.sort(soloRankCompare).slice(0,5);return Object.values(v).sort(soloRankCompare).slice(0,5);}catch(e){return local.sort(soloRankCompare).slice(0,5);}}
+async function getSoloLeaders(subject){
+  const local=readLocalSolo()[subject]||[];
+
+  // ให้ Solo เชื่อม Firebase ก่อนอ่านสถิติ
+  if(!db && !initFirebase()){
+    return local.sort(soloRankCompare).slice(0,5);
+  }
+
+  try{
+    const snap=await get(soloLeaderboardRoot().child(subject));
+    const v=snap.val();
+
+    if(!v){
+      return local.sort(soloRankCompare).slice(0,5);
+    }
+
+    return Object.values(v)
+      .sort(soloRankCompare)
+      .slice(0,5);
+
+  }catch(e){
+    console.error("อ่าน Solo TOP 5 ไม่สำเร็จ:",e);
+    return local.sort(soloRankCompare).slice(0,5);
+  }
+}
 async function saveSoloLeaderboard(subject,name,correct,timeMs){
- if(!subject||!name)return;const now=Date.now(),key=cleanName(name).replace(/[.#$/\[\]]/g,"_").slice(0,80)||"player";const incoming={name:displayName(name),correct:Number(correct||0),timeMs:Number(timeMs||0),updatedAt:now};
- const local=readLocalSolo(),arr=Array.isArray(local[subject])?local[subject]:[],idx=arr.findIndex(x=>cleanName(x.name)===cleanName(name));
- if(idx>=0){if(soloRankCompare(incoming,arr[idx])<0)arr[idx]={...arr[idx],...incoming};}else arr.push(incoming);local[subject]=arr.sort(soloRankCompare).slice(0,5);writeLocalSolo(local);if(!db)return;
- try{const node=soloLeaderboardRoot().child(subject).child(key),snap=await get(node),old=snap.val();if(!old||soloRankCompare(incoming,old)<0)await set(node,incoming);const allSnap=await get(soloLeaderboardRoot().child(subject));const all=Object.entries(allSnap.val()||{}).map(([id,x])=>({...x,id})).sort(soloRankCompare);const updates={};all.slice(5).forEach(x=>updates[x.id]=null);if(Object.keys(updates).length)await update(soloLeaderboardRoot().child(subject),updates);writeLocalSolo({...readLocalSolo(),[subject]:all.slice(0,5)});}catch(e){console.warn("solo leaderboard save",e);}
+
+  if(!subject || !name) return false;
+
+  // สำคัญ: บังคับให้ Solo เชื่อม Firebase
+  if(!db && !initFirebase()){
+    console.error("Solo: Firebase ยังไม่พร้อม");
+    return false;
+  }
+
+  const now=Date.now();
+
+  const key=cleanName(name)
+    .replace(/[.#$/\[\]]/g,"_")
+    .slice(0,80) || "player";
+
+  const incoming={
+    name:displayName(name),
+    correct:Number(correct||0),
+    timeMs:Number(timeMs||0),
+    updatedAt:now
+  };
+
+  try{
+
+    const node=soloLeaderboardRoot()
+      .child(subject)
+      .child(key);
+
+    const snap=await get(node);
+    const old=snap.val();
+
+    // เก็บเฉพาะสถิติที่ดีกว่าเดิม
+    if(!old || soloRankCompare(incoming,old)<0){
+      await set(node,incoming);
+    }
+
+    // อ่านข้อมูลจาก Firebase ใหม่
+    const allSnap=await get(
+      soloLeaderboardRoot().child(subject)
+    );
+
+    const all=Object.entries(allSnap.val()||{})
+      .map(([id,x])=>({
+        ...x,
+        id
+      }))
+      .sort(soloRankCompare);
+
+    // ตัดเหลือ TOP 5
+    const updates={};
+
+    all.slice(5).forEach(x=>{
+      updates[x.id]=null;
+    });
+
+    if(Object.keys(updates).length){
+      await update(
+        soloLeaderboardRoot().child(subject),
+        updates
+      );
+    }
+
+    // อัปเดต local cache ให้ตรง Firebase
+    const local=readLocalSolo();
+
+    local[subject]=all
+      .slice(0,5)
+      .map(x=>({
+        name:x.name,
+        correct:Number(x.correct||0),
+        timeMs:Number(x.timeMs||0),
+        updatedAt:x.updatedAt
+      }));
+
+    writeLocalSolo(local);
+
+    console.log(
+      "Solo TOP 5 บันทึกสำเร็จ:",
+      subject,
+      incoming.name,
+      incoming.correct,
+      incoming.timeMs
+    );
+
+    return true;
+
+  }catch(e){
+
+    console.error(
+      "Solo TOP 5 Firebase บันทึกไม่สำเร็จ:",
+      e
+    );
+
+    return false;
+  }
 }
 function soloSubjectCards(){return AWAKAD_SUBJECTS.map(s=>`<button type="button" class="btn green solo-choice-card" onclick="startSoloSetup('${s.id}')"><span style="font-size:50px">${s.icon}</span><span style="font-size:25px">${s.name}</span><small style="font-size:14px;opacity:.8"></small></button>`).join("");}
 function updateDeviceBadge(){const e=document.querySelector("#deviceBadge,#homeDeviceBadge");if(e)e.textContent=window.AWAKAD_DEVICE==="mobile"?"📱 ໂໝດມືຖື":"💻 ໂໝດຄອມພິວເຕີ";}
@@ -3101,6 +3216,13 @@ async function soloResultPage(timeMs){
 }
 
 window.soloTop5Page=async function(subject=soloSubjectId||AWAKAD_SUBJECTS[0].id){
+
+  // ให้หน้า Solo TOP 5 เชื่อม Firebase ก่อนโหลดคะแนน
+  if(!db){
+    initFirebase();
+  }
+
+  const leaders=await getSoloLeaders(subject);
   const leaders=await getSoloLeaders(subject);
   const slots=["one","two","three","four","five"];
 
